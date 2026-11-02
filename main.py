@@ -1,5 +1,7 @@
 """Bot de Discord: boas-vindas com imagem, botões e comandos híbridos."""
 
+import asyncio
+import functools
 import hashlib
 import io
 import json
@@ -57,6 +59,25 @@ def carregar_env(caminho: Path) -> None:
 carregar_env(BASE_DIR / ".env")
 
 
+def ler_ids_env(nome: str) -> set[int]:
+    """Lê do .env uma lista de IDs separada por vírgula, espaço ou ponto e vírgula."""
+
+    return {
+        int(pedaco)
+        for pedaco in re.split(r"[^\d]+", os.getenv(nome, ""))
+        if pedaco.isdigit()
+    }
+
+
+# Cargo ADM por ID: renomear o cargo (ou escrever "Adm" com acento
+# diferente) não muda mais quem modera. Sem a variável no .env, o bot avisa
+# e volta a comparar pelo nome do cargo.
+CARGOS_ADM = ler_ids_env("CARGO_ADM_ID")
+
+if not CARGOS_ADM:
+    print("CARGO_ADM_ID não configurado; usando o nome do cargo (\"adm\").")
+
+
 def ler_canal_boas_vindas() -> int:
     valor = os.getenv("CANAL_BOAS_VINDAS", "").strip()
 
@@ -85,9 +106,27 @@ def ler_canal_novidades() -> int:
     return CANAL_NOVIDADES_PADRAO
 
 
+def ler_canal_opcional(nome: str) -> int | None:
+    """Lê um ID de canal opcional do ambiente (None = recurso desligado)."""
+
+    valor = os.getenv(nome, "").strip()
+
+    if not valor:
+        return None
+
+    try:
+        return int(valor)
+    except ValueError:
+        print(f"{nome} inválido ({valor!r}); recurso desligado.")
+
+    return None
+
+
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CANAL_BOAS_VINDAS = ler_canal_boas_vindas()
 CANAL_NOVIDADES = ler_canal_novidades()
+CANAL_ARMADILHA = ler_canal_opcional("CANAL_ARMADILHA")
+CANAL_STAFF = ler_canal_opcional("CANAL_STAFF")
 
 # -------------------------------------------------------------------- bot
 
@@ -98,15 +137,39 @@ intents.members = True
 bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
 
 
-@bot.event
-async def on_ready():
+async def sincronizar_comandos() -> None:
+    """Sincroniza os slash commands uma vez, antes do bot ficar online.
+
+    No on_ready isso rodava a cada reconexão e segurava a resposta dos
+    comandos logo depois do start; o setup_hook acontece uma vez só.
+    """
+
     try:
         sincronizados = await bot.tree.sync()
         print(f"Sincronizado {len(sincronizados)} comandos!")
     except discord.HTTPException as erro:
         print(f"Falha ao sincronizar os comandos: {erro}")
 
+
+# O login do discord.py chama ``await bot.setup_hook()`` antes de conectar.
+bot.setup_hook = sincronizar_comandos  # type: ignore[method-assign]
+
+
+_iniciado = False
+
+
+@bot.event
+async def on_ready():
+    global _iniciado
+
     print(f"{bot.user} está online!")
+
+    # Reconexão dispara o on_ready de novo: recarregar o automod e postar as
+    # novidades só faz sentido uma vez por inicialização.
+    if _iniciado:
+        return
+
+    _iniciado = True
 
     _palavras_automod[:] = carregar_palavras_automod()
     print(f"Automod: {len(_palavras_automod)} palavra(s) bloqueada(s).")
@@ -134,8 +197,13 @@ NOMES_DE_FONTE = (
 )
 
 
+@functools.lru_cache(maxsize=None)
 def carregar_fonte(tamanho: int) -> ImageFont.ImageFont:
-    """Carrega uma fonte do sistema e cai para a padrão se não encontrar."""
+    """Carrega uma fonte do sistema e cai para a padrão se não encontrar.
+
+    O resultado fica guardado por tamanho: sem o cache, cada boas-vindas
+    relia o arquivo da fonte do disco a cada texto desenhado.
+    """
 
     for caminho in FONTES_CONHECIDAS:
         try:
@@ -191,17 +259,31 @@ def criar_fundo(largura: int, altura: int) -> Image.Image:
     return fundo
 
 
-async def carregar_avatar(member: discord.Member, tamanho: int):
-    """Baixa o avatar do membro já cortado em círculo."""
+async def baixar_avatar(member: discord.Member) -> bytes | None:
+    """Baixa o PNG do avatar; None quando não dá para pegar a imagem."""
 
     try:
-        dados = await member.display_avatar.replace(
+        return await member.display_avatar.replace(
             size=256,
             format="png"
         ).read()
-        avatar = Image.open(io.BytesIO(dados)).convert("RGBA")
-        avatar = avatar.resize((tamanho, tamanho), Image.LANCZOS)
     except (discord.HTTPException, OSError):
+        return None
+
+
+def montar_avatar(dados: bytes | None, tamanho: int):
+    """Transforma os bytes do avatar em círculo (CPU pura)."""
+
+    avatar = None
+
+    if dados is not None:
+        try:
+            avatar = Image.open(io.BytesIO(dados)).convert("RGBA")
+            avatar = avatar.resize((tamanho, tamanho), Image.LANCZOS)
+        except OSError:
+            avatar = None
+
+    if avatar is None:
         avatar = Image.new("RGBA", (tamanho, tamanho), (60, 60, 80, 255))
 
     mascara = Image.new("L", (tamanho, tamanho), 0)
@@ -213,18 +295,20 @@ async def carregar_avatar(member: discord.Member, tamanho: int):
     return avatar, mascara
 
 
-async def criar_imagem(member: discord.Member) -> Image.Image:
-    """Monta o cartão de boas-vindas do membro."""
+def desenhar_cartao(
+    member: discord.Member,
+    dados_avatar: bytes | None
+) -> Image.Image:
+    """Desenha o cartão de boas-vindas (roda numa thread, não no loop)."""
 
     largura, altura = 900, 320
     tamanho_avatar = 180
+    avatar, mascara = montar_avatar(dados_avatar, tamanho_avatar)
     x_avatar = 60
     y_avatar = (altura - tamanho_avatar) // 2
 
     imagem = criar_fundo(largura, altura)
     desenho = ImageDraw.Draw(imagem)
-
-    avatar, mascara = await carregar_avatar(member, tamanho_avatar)
 
     desenho.ellipse(
         (
@@ -281,6 +365,31 @@ async def criar_imagem(member: discord.Member) -> Image.Image:
     return imagem
 
 
+def gerar_cartao_png(
+    member: discord.Member,
+    dados_avatar: bytes | None
+) -> bytes:
+    """Desenha e salva o cartão em PNG (roda numa thread)."""
+
+    imagem = desenhar_cartao(member, dados_avatar)
+    buffer = io.BytesIO()
+    imagem.save(buffer, format="PNG")
+
+    return buffer.getvalue()
+
+
+async def criar_imagem(member: discord.Member) -> bytes:
+    """Monta o cartão de boas-vindas do membro.
+
+    Só o download do avatar fica no loop; o desenho e o save em PNG, que são
+    CPU puro, rodam numa thread para o bot não travar a cada entrada.
+    """
+
+    dados_avatar = await baixar_avatar(member)
+
+    return await asyncio.to_thread(gerar_cartao_png, member, dados_avatar)
+
+
 def criar_arquivo(caminho: Path, nome_arquivo: str) -> discord.File:
     """Cria o anexo a partir de um arquivo local."""
 
@@ -296,15 +405,12 @@ async def on_member_join(member: discord.Member):
         return
 
     try:
-        imagem = await criar_imagem(member)
-        buffer = io.BytesIO()
-        imagem.save(buffer, format="PNG")
-        buffer.seek(0)
+        png = await criar_imagem(member)
 
         await canal.send(
             f"Bem-vindo(a) {member.mention} ao servidor! "
             "Veja as regras e divirta-se!",
-            file=discord.File(buffer, filename="bem-vindo.png")
+            file=discord.File(io.BytesIO(png), filename="bem-vindo.png")
         )
     except (discord.HTTPException, OSError) as erro:
         print(f"Falha ao enviar a mensagem de boas-vindas: {erro!r}")
@@ -316,6 +422,26 @@ async def on_member_join(member: discord.Member):
 @bot.command()
 async def teste(ctx: commands.Context):
     await ctx.reply("Teste realizado com sucesso!")
+
+
+@bot.command(name="sync")
+async def sync(ctx: commands.Context):
+    """Re-sincroniza os slash commands (só o dono do bot)."""
+
+    if not await bot.is_owner(ctx.author):
+        await ctx.reply(
+            "Só o dono do bot pode usar esse comando.",
+            delete_after=LIMPAR_SEGUNDOS_AVISO
+        )
+        return
+
+    try:
+        sincronizados = await bot.tree.sync()
+    except discord.HTTPException as erro:
+        await ctx.reply(f"Deu erro ao sincronizar: `{erro.status}`.")
+        return
+
+    await ctx.reply(f"Sincronizado {len(sincronizados)} comando(s)!")
 
 
 @bot.command()
@@ -711,13 +837,13 @@ async def ajuda(ctx: commands.Context):
             "`/dado` ou `?dado` — Rola um dado.\n"
             "`/enquete` ou `?enquete` — Cria uma enquete com até 5 opções.\n"
             "`/organizar_cargos` ou `?organizar_cargos` — "
-            "Reorganiza os cargos do servidor (só ADM)."
+            "Reorganiza os cargos do servidor (dono, admin ou ADM)."
         ),
         inline=False
     )
 
     embed.add_field(
-        name="🔧 Administração (só cargo ADM)",
+        name="🔧 Administração (dono, admin ou ADM)",
         value=(
             "`/lock` — Fecha o canal para os membros.\n"
             "`/unlock` — Abre o canal de novo.\n"
@@ -737,7 +863,8 @@ async def ajuda(ctx: commands.Context):
         name="⌨️ Somente com prefixo ?",
         value=(
             "`?teste` — Testa se o bot está funcionando.\n"
-            "`?enviar_embed` — Envia um embed com uma mensagem sua."
+            "`?enviar_embed` — Envia um embed com uma mensagem sua.\n"
+            "`?sync` — Re-sincroniza os comandos slash (só o dono do bot)."
         ),
         inline=False
     )
@@ -788,11 +915,37 @@ def normalizar_nome(nome: str) -> str:
 
 
 def tem_cargo_adm(membro) -> bool:
-    """Diz se o membro tem o cargo ADM (nome comparado sem acento)."""
-    return any(
-        normalizar_nome(cargo.name) == "adm"
-        for cargo in getattr(membro, "roles", ())
-    )
+    """Diz se o membro tem o cargo ADM.
+
+    Compara por ID (CARGO_ADM_ID no .env) e, se a variável não existir, cai
+    para o nome "adm" como antes.
+    """
+
+    cargos = list(getattr(membro, "roles", ()))
+
+    if CARGOS_ADM:
+        return any(cargo.id in CARGOS_ADM for cargo in cargos)
+
+    return any(normalizar_nome(cargo.name) == "adm" for cargo in cargos)
+
+
+def pode_moderar(membro) -> bool:
+    """Regra única de moderação: dono, administrador ou cargo ADM."""
+
+    if membro is None:
+        return False
+
+    guild = getattr(membro, "guild", None)
+
+    if guild is not None and membro.id == getattr(guild, "owner_id", None):
+        return True
+
+    permissoes = getattr(membro, "guild_permissions", None)
+
+    if getattr(permissoes, "administrator", False):
+        return True
+
+    return tem_cargo_adm(membro)
 
 
 def calcular_nova_ordem(cargos, id_cargo_do_bot, limite_bot, limite_autor):
@@ -870,9 +1023,10 @@ async def organizar_cargos(ctx: commands.Context):
     autor = ctx.author
     eu = guild.me
 
-    if not isinstance(autor, discord.Member) or not tem_cargo_adm(autor):
+    if not isinstance(autor, discord.Member) or not pode_moderar(autor):
         await ctx.reply(
-            "Só o cargo **ADM** pode usar esse comando.",
+            "Só o **dono** do servidor, administradores ou o cargo **ADM** "
+            "podem usar esse comando.",
             ephemeral=True
         )
         return
@@ -914,12 +1068,14 @@ async def organizar_cargos(ctx: commands.Context):
         )
         return
 
+    # `ordem` vem de cima para baixo e no Discord posição maior = mais alto,
+    # então o primeiro da lista fica com a maior posição livre.
+    degraus = sorted((cargo.position for cargo in ordem), reverse=True)
+    novas_posicoes = dict(zip(ordem, degraus))
+
     try:
         await guild.edit_role_positions(
-            positions={
-                cargo: indice
-                for indice, cargo in enumerate(ordem, start=1)
-            },
+            positions=novas_posicoes,
             reason=f"organizar_cargos usado por {autor}"
         )
     except discord.Forbidden:
@@ -962,11 +1118,11 @@ async def organizar_cargos(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
-# -------------------------------------------- administração (só ADM)
+# ------------------------------- administração (dono, admin ou cargo ADM)
 
 
 async def exigir_adm(ctx: commands.Context) -> bool:
-    """Confere servidor e cargo ADM; avisa e devolve False quando não pode."""
+    """Confere servidor e permissão de moderar; avisa e devolve False."""
 
     if ctx.guild is None:
         await ctx.reply(
@@ -975,11 +1131,10 @@ async def exigir_adm(ctx: commands.Context) -> bool:
         )
         return False
 
-    autor = ctx.author
-
-    if not tem_cargo_adm(autor):
+    if not pode_moderar(ctx.author):
         await ctx.reply(
-            "Só o cargo **ADM** pode usar esse comando.",
+            "Só o **dono** do servidor, administradores ou o cargo **ADM** "
+            "podem usar esse comando.",
             ephemeral=True
         )
         return False
@@ -1010,7 +1165,7 @@ def motivo_de_nao_punir(guild, autor, alvo) -> str | None:
 
 @bot.hybrid_command(
     name="lock",
-    description="Fecha um canal para os membros falarem (só ADM)"
+    description="Fecha um canal para os membros falarem (moderação)"
 )
 @app_commands.describe(canal="Canal a fechar (padrão: este canal)")
 async def lock(
@@ -1073,7 +1228,7 @@ async def lock(
 
 @bot.hybrid_command(
     name="unlock",
-    description="Abre um canal que estava fechado (só ADM)"
+    description="Abre um canal que estava fechado (moderação)"
 )
 @app_commands.describe(canal="Canal a abrir (padrão: este canal)")
 async def unlock(
@@ -1133,7 +1288,7 @@ async def unlock(
 
 @bot.hybrid_command(
     name="ban",
-    description="Bane um membro do servidor (só ADM)"
+    description="Bane um membro do servidor (moderação)"
 )
 @app_commands.describe(
     membro="Quem vai ser banido",
@@ -1182,7 +1337,7 @@ async def ban(
 
 @bot.hybrid_command(
     name="unban",
-    description="Desbane um usuário pelo ID (só ADM)"
+    description="Desbane um usuário pelo ID (moderação)"
 )
 @app_commands.describe(
     id_usuario="ID do usuário banido (clique com o botão direito → Copiar ID)",
@@ -1255,7 +1410,7 @@ async def unban(
 
 @bot.hybrid_command(
     name="kick",
-    description="Expulsa um membro do servidor (só ADM)"
+    description="Expulsa um membro do servidor (moderação)"
 )
 @app_commands.describe(
     membro="Quem vai ser expulso",
@@ -1304,7 +1459,7 @@ async def kick(
 
 @bot.hybrid_command(
     name="mute",
-    description="Silencia um membro por um tempo (só ADM)"
+    description="Silencia um membro por um tempo (moderação)"
 )
 @app_commands.describe(
     membro="Quem vai ficar sem falar",
@@ -1364,7 +1519,7 @@ async def mute(
 
 @bot.hybrid_command(
     name="unmute",
-    description="Devolve a fala de um membro silenciado (só ADM)"
+    description="Devolve a fala de um membro silenciado (moderação)"
 )
 @app_commands.describe(membro="Quem vai poder falar de novo")
 async def unmute(ctx: commands.Context, membro: discord.Member):
@@ -1398,28 +1553,6 @@ async def unmute(ctx: commands.Context, membro: discord.Member):
 
 
 # ------------------------------------------- dar e tirar cargos (dono/ADM)
-
-
-async def exigir_dono_ou_adm(ctx: commands.Context) -> bool:
-    """Confere servidor e quem pode dar ou tirar cargos: dono ou ADM."""
-
-    if ctx.guild is None:
-        await ctx.reply(
-            "Esse comando só funciona dentro de um servidor.",
-            ephemeral=True
-        )
-        return False
-
-    autor = ctx.author
-
-    if autor.id == ctx.guild.owner_id or tem_cargo_adm(autor):
-        return True
-
-    await ctx.reply(
-        "Só o **dono** do servidor ou o cargo **ADM** pode usar esse comando.",
-        ephemeral=True
-    )
-    return False
 
 
 async def cargo_liberado(ctx: commands.Context, cargo: discord.Role) -> bool:
@@ -1478,7 +1611,7 @@ async def cargo_liberado(ctx: commands.Context, cargo: discord.Role) -> bool:
 
 @bot.hybrid_group(
     name="role",
-    description="Dá ou tira um cargo de um membro (dono e ADM)",
+    description="Dá ou tira um cargo de um membro (dono, admin e ADM)",
     invoke_without_command=True
 )
 async def role(ctx: commands.Context):
@@ -1502,7 +1635,7 @@ async def role_add(
     *,
     cargo: discord.Role
 ):
-    if not await exigir_dono_ou_adm(ctx):
+    if not await exigir_adm(ctx):
         return
 
     if not await cargo_liberado(ctx, cargo):
@@ -1555,7 +1688,7 @@ async def role_remove(
     *,
     cargo: discord.Role
 ):
-    if not await exigir_dono_ou_adm(ctx):
+    if not await exigir_adm(ctx):
         return
 
     if not await cargo_liberado(ctx, cargo):
@@ -1603,30 +1736,13 @@ LIMPAR_MAXIMO = 1000
 LIMPAR_SEGUNDOS_AVISO = 10
 
 
-def tem_autorizacao_de_limpeza(membro) -> bool:
-    """Diz se o membro pode limpar mensagens: dono, admin ou cargo ADM."""
-
-    if membro is None:
-        return False
-
-    guild = getattr(membro, "guild", None)
-
-    if guild is not None and membro.id == getattr(guild, "owner_id", None):
-        return True
-
-    if getattr(membro.guild_permissions, "administrator", False):
-        return True
-
-    return tem_cargo_adm(membro)
-
-
 async def pode_limpar(ctx: commands.Context) -> bool:
     """Valida quem pediu a limpeza, incluindo o dono do próprio bot."""
 
     if await bot.is_owner(ctx.author):
         return True
 
-    return tem_autorizacao_de_limpeza(ctx.author)
+    return pode_moderar(ctx.author)
 
 
 async def responder_rapido(ctx: commands.Context, texto: str) -> None:
@@ -1643,12 +1759,11 @@ async def responder_rapido(ctx: commands.Context, texto: str) -> None:
 
 @bot.hybrid_command(
     name="clear",
-    description="Apaga mensagens do canal (só administração)"
+    description="Apaga mensagens do canal (dono, admin ou ADM)"
 )
 @app_commands.describe(
     quantidade=f"Quantas mensagens apagar (1 a {LIMPAR_MAXIMO})"
 )
-@app_commands.default_permissions(manage_messages=True)
 async def clear(ctx: commands.Context, quantidade: int):
     if ctx.guild is None:
         await responder_rapido(
@@ -1705,6 +1820,12 @@ async def clear(ctx: commands.Context, quantidade: int):
         )
         return
 
+    # Apagar até 1000 mensagens pode passar dos 3 segundos que o Discord
+    # espera pela resposta do slash; avisar "pensando" evita o "o aplicativo
+    # não respondeu" (no ?clear não existe interação para adiar).
+    if ctx.interaction is not None:
+        await ctx.defer(ephemeral=True)
+
     try:
         apagadas = len(await canal.purge(
             limit=quantidade,
@@ -1743,35 +1864,29 @@ async def clear(ctx: commands.Context, quantidade: int):
 
 _palavras_automod: list[str] = []
 
-# Cargos que o automod nunca apaga: os IDs estão no .env (AUTOMOD_ISENTOS)
-# e os nomes abaixo valem mesmo sem o .env configurado.
-CARGOS_ISENTOS_NOME = ("dono", "adm")
-
-
-def ler_cargos_isentos() -> set[int]:
-    """Lê do .env os IDs de cargos isentos da censura (AUTOMOD_ISENTOS)."""
-
-    bruto = os.getenv("AUTOMOD_ISENTOS", "")
-    return {
-        int(pedaco)
-        for pedaco in re.split(r"[^\d]+", bruto)
-        if pedaco.isdigit()
-    }
-
-
-_cargos_isentos = ler_cargos_isentos()
+# Cargos que o automod nunca apaga: AUTOMOD_ISENTOS no .env, mais os IDs
+# configurados em CARGO_ADM_ID.
+CARGOS_ISENTOS = ler_ids_env("AUTOMOD_ISENTOS")
 
 
 def tem_cargo_isento(membro) -> bool:
-    """Diz se o membro está fora da censura (cargo dono/adm)."""
+    """Diz se o membro está fora da censura.
+
+    Compara por ID (AUTOMOD_ISENTOS e CARGO_ADM_ID) e, se CARGO_ADM_ID não
+    existir, cai para os nomes "dono" e "adm" como antes.
+    """
 
     cargos = list(getattr(membro, "roles", ()))
+    isentos = CARGOS_ISENTOS | CARGOS_ADM
 
-    if any(cargo.id in _cargos_isentos for cargo in cargos):
+    if any(cargo.id in isentos for cargo in cargos):
         return True
 
+    if CARGOS_ADM:
+        return False
+
     return any(
-        normalizar_nome(cargo.name) in CARGOS_ISENTOS_NOME
+        normalizar_nome(cargo.name) in ("dono", "adm")
         for cargo in cargos
     )
 
@@ -1883,17 +1998,113 @@ async def aplicar_automod(mensagem: discord.Message) -> bool:
     return True
 
 
+# ------------------------------------------------------- canal armadilha
+
+MOTIVO_ARMADILHA = "Canal armadilha: escreveu onde não devia"
+SEGUNDOS_APAGAR_ARMADILHA = 3600
+
+
+async def avisar_staff(autor, resultado: str) -> None:
+    """Conta no canal da staff quem caiu na armadilha e o que aconteceu."""
+
+    if CANAL_STAFF is None:
+        return
+
+    canal = bot.get_channel(CANAL_STAFF)
+
+    if not isinstance(canal, discord.abc.Messageable):
+        print(f"Canal da staff {CANAL_STAFF} não encontrado.")
+        return
+
+    try:
+        await canal.send(
+            f"🪤 {autor} ({autor.id}) escreveu na armadilha: {resultado}"
+        )
+    except discord.HTTPException as erro:
+        print(f"Não consegui avisar a staff da armadilha: {erro}")
+
+
+async def aplicar_armadilha(mensagem: discord.Message) -> bool:
+    """Dá softban em quem escrever no canal armadilha.
+
+    Vale para qualquer pessoa, menos o próprio bot: staff, administradores,
+    dono do servidor e outros bots inclusive. Devolve True quando a mensagem
+    foi tratada aqui, para o on_message não seguir para o automod nem para os
+    comandos.
+    """
+
+    if CANAL_ARMADILHA is None:
+        return False
+
+    if mensagem.guild is None or mensagem.channel.id != CANAL_ARMADILHA:
+        return False
+
+    autor = mensagem.author
+    eu = bot.user
+
+    if eu is not None and autor.id == eu.id:
+        return False
+
+    guild = mensagem.guild
+
+    try:
+        await guild.ban(
+            autor,
+            reason=MOTIVO_ARMADILHA,
+            delete_message_seconds=SEGUNDOS_APAGAR_ARMADILHA
+        )
+    except discord.Forbidden:
+        resultado = "NÃO consegui banir (dono do servidor ou cargo acima do bot)"
+    except discord.HTTPException as erro:
+        resultado = f"NÃO consegui banir (erro {erro.status})"
+    else:
+        try:
+            await guild.unban(autor, reason="Softban da armadilha")
+            resultado = "softban concluído"
+        except discord.HTTPException as erro:
+            resultado = (
+                "banido, mas o desban falhou: desbane na mão "
+                f"(erro {erro.status})"
+            )
+
+    try:
+        await mensagem.delete()
+    except discord.HTTPException as erro:
+        print(f"Não consegui apagar a mensagem da armadilha: {erro}")
+
+    await avisar_staff(autor, resultado)
+
+    return True
+
+
 @bot.event
 async def on_message(mensagem: discord.Message):
+    if await aplicar_armadilha(mensagem):
+        return
+
     barrada = await aplicar_automod(mensagem)
 
     if not barrada:
         await bot.process_commands(mensagem)
 
 
+@bot.event
+async def on_message_edit(
+    antes: discord.Message,
+    depois: discord.Message
+):
+    # Sem isso dava para mandar "oi", editar para a palavra bloqueada e
+    # escapar da censura. O próprio aplicar_automod ignora bots, DMs,
+    # conteúdo vazio e membros isentos.
+    if antes.content == depois.content:
+        return
+
+    await aplicar_automod(depois)
+
+
 @bot.hybrid_group(
     name="automod",
-    description="Palavras censuradas pelo automod (só ADM)",
+    description="Palavras censuradas pelo automod (moderação)",
     invoke_without_command=True
 )
 async def automod(ctx: commands.Context):
