@@ -82,3 +82,29 @@
 - Erros de comandos agora geram aviso no chat em vez de falhar em silêncio.
 - As boas-vindas não derrubam mais o bot quando o canal configurado está indisponível.
 - `/ajuda` lista os comandos das versões slash e prefixada.
+## 02/11/2026 — Nova central de ajuda com abas, cargo Moderador e checagem /automod
+
+### Novos recursos
+- **Central de ajuda com abas**: `/ajuda` agora abre uma interface com abas navegáveis (Início, Social, Informações, Prefixo, Moderação, Servidor, AutoMod). A aba atual fica azul e travada nos botões. Só quem chamou o comando consegue navegar, e os botões somem após 3 minutos.
+- **Nova estrutura de abas:**
+  - 🏠 Início, 🎉 Social, 📰 Bot, ⌨️ Prefixo — visíveis para todos
+  - 🛡️ Moderação — visível para Moderador ou superior
+  - ⚙️ Servidor — visível para ADM ou superior
+  - 🤖 AutoMod — visível para cargo automod (e ADM/dono)
+- **Moderador (novo cargo):** cargo ID 1566858218725183592. Moderador pode usar: /lock, /unlock, /kick, /mute, /unmute e /clear. Limites: /mute até 24 h e /clear até 100 mensagens. ADM e acima têm 28 dias e 1000.
+- **Apenas ADM ou superior:** /ban, /unban, /role, /organizar_cargos aparecem na aba Moderação.
+- **Checagem /automod:** hoje o bot compara o cargo automod pelo nome, não pelo ID. Mantido assim; se renomear o cargo a checagem quebra. Dono e ADM têm acesso. Para liberar só o cargo automod, mude `AUTOMOD_APENAS_CARGO = True` no topo.
+- **Aba Servidor atualizada:** /organizar_cargos e /role já eram só de ADM, mas a aba agora fica oculta para quem não pode usar. Incluídos /role add e /role remove, que existiam no código mas não estavam no ?ajuda.
+- **Cargo Moderador separado:** na ordem `/organizar_cargos`, Moderador tem grupo próprio logo abaixo do BobBOT, para o bot continuar conseguindo punir moderadores.
+- **Permissões do Moderador:** /lock e /clear funcionam sem Gerenciar canais para o Moderador, porque quem executa é o bot.
+
+### Melhorias
+- `/role add` e `/role remove`: subcomandos novos que dão e tiram cargos de membros (dono, admin e ADM). Incluídos na central de ajuda.
+- A ordem de cargos em `/organizar_cargos` agora separa Moderador em grupo próprio abaixo do BobBOT, evitando que o bot fique abaixo de moderadores ao punir.
+- Nova interface de `/ajuda` com destaque visual da aba ativa e navegação bloqueada para outros usuários.
+- Os botões da central de ajuda agora têm timeout de 3 minutos e somem após inatividade.
+
+### Corrigido
+- Editar uma mensagem para incluir palavra bloqueada agora cai no automod — antes a edição passava direto pela censura.
+- README e `.env.example` atualizados com as variáveis novas (`CARGO_MODERADOR_ID`, `AUTOMOD_APENAS_CARGO`, `MODERADOR_MUTE_MAX_MINUTOS`, `MODERADOR_CLEAR_MAX`).
+- Estrutura de cargos em `/organizar_cargos` agora coloca Moderador abaixo do BobBOT, garantindo que o bot pode punir moderadores.
