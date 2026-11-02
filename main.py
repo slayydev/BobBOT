@@ -34,6 +34,19 @@ CAMINHO_ULTIMA_NOVIDADE = BASE_DIR / "logs" / "ultima_novidade.txt"
 CAMINHO_AUTOMOD = BASE_DIR / "logs" / "automod.json"
 
 CARGO_AUTOMOD = "automod"
+
+# Cargo Moderador (o mais baixo da staff). Pode ser trocado no .env com
+# CARGO_MODERADOR_ID; sem a variável vale o ID abaixo.
+CARGO_MODERADOR_ID_PADRAO = 1566858218725183592
+
+# Limites do Moderador. ADM, dono e administradores seguem com os limites
+# normais (mute até 28 dias e clear até 1000).
+MODERADOR_MUTE_MAX_MINUTOS = 24 * 60
+MODERADOR_CLEAR_MAX = 100
+
+# True  = /automod só para quem tem o cargo automod;
+# False = também para dono, administradores e ADM.
+AUTOMOD_APENAS_CARGO = False
 MENSAGEM_AUTOMOD = "Ei! {mencao} você não pode falar isto!"
 
 COR_FUNDO_INICIO = (28, 33, 74)
@@ -76,6 +89,10 @@ CARGOS_ADM = ler_ids_env("CARGO_ADM_ID")
 
 if not CARGOS_ADM:
     print("CARGO_ADM_ID não configurado; usando o nome do cargo (\"adm\").")
+
+CARGOS_MODERADOR = (
+    ler_ids_env("CARGO_MODERADOR_ID") or {CARGO_MODERADOR_ID_PADRAO}
+)
 
 
 def ler_canal_boas_vindas() -> int:
@@ -813,74 +830,228 @@ async def novidades(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
-@bot.hybrid_command(
-    name="ajuda",
-    description="Lista todos os comandos do bot"
-)
-async def ajuda(ctx: commands.Context):
+# ------------------------------------------------------------------ ajuda
+
+LINHA_PREFIXO = "Todos funcionam com `/` e com `?`."
+
+# (chave, emoji, nome, rótulo do botão, quem vê)
+ABAS_AJUDA = [
+    ("inicio", "🏠", "Início", "Início", "todos"),
+    ("social", "🎉", "Social e Diversão", "Social", "todos"),
+    ("info", "📰", "Informações do Bot", "Bot", "todos"),
+    ("prefixo", "⌨️", "Somente com prefixo", "Prefixo", "todos"),
+    ("moderacao", "🛡️", "Moderação", "Moderação", "moderador"),
+    ("servidor", "⚙️", "Servidor", "Servidor", "adm"),
+    ("automod", "🤖", "AutoMod", "AutoMod", "automod"),
+]
+
+
+def abas_visiveis(membro) -> list[tuple]:
+    """Abas que esse membro enxerga, na ordem de exibição."""
+
+    liberadas = {
+        "todos": True,
+        "moderador": pode_moderar_basico(membro),
+        "adm": pode_moderar(membro),
+        "automod": pode_usar_automod(membro),
+    }
+
+    return [aba for aba in ABAS_AJUDA if liberadas[aba[4]]]
+
+
+def texto_da_aba(chave: str, membro) -> str:
+    """Conteúdo (descrição do embed) de uma aba da ajuda."""
+
+    if chave == "inicio":
+        return (
+            "Oi! Eu sou o **BOB BOT**. Aqui você encontra todos os meus "
+            "comandos, separados por categoria.\n\n"
+            "**Como navegar:** use os botões abaixo da mensagem para trocar "
+            "de categoria.\n\n"
+            "**Dica:** nos comandos com `?`, use aspas para textos com "
+            "espaço:\n"
+            "`?enquete \"Qual jogo?\" \"Minecraft\" \"Valorant\"`"
+        )
+
+    if chave == "social":
+        return (
+            f"{LINHA_PREFIXO}\n\n"
+            "`/ola` — Envia mensagens de saudação.\n"
+            "`/oi_posso_falar` — Oi, posso falar?\n"
+            "`/avatar` — Mostra o avatar de um membro.\n"
+            "`/dado` — Rola um dado.\n"
+            "`/enquete` — Cria uma enquete com até 5 opções."
+        )
+
+    if chave == "info":
+        return (
+            f"{LINHA_PREFIXO}\n\n"
+            "`/ajuda` — Mostra esta central de ajuda.\n"
+            "`/novidades` — Mostra as últimas mudanças.\n"
+            "`/ping` — Mostra a latência do bot."
+        )
+
+    if chave == "prefixo":
+        return (
+            "Só funcionam com `?`.\n\n"
+            "`?teste` — Testa se o bot está funcionando.\n"
+            "`?enviar_embed` — Envia um embed com uma mensagem sua.\n"
+            "`?sync` — Re-sincroniza os comandos slash "
+            "(só o dono do bot)."
+        )
+
+    if chave == "moderacao":
+        linhas = [
+            "Para **Moderador** ou superior.\n",
+            "`/lock` — Fecha o canal para os membros.",
+            "`/unlock` — Abre o canal de novo.",
+            "`/kick` — Expulsa um membro.",
+            f"`/mute` — Deixa um membro sem falar por X minutos "
+            f"(Moderador: até {MODERADOR_MUTE_MAX_MINUTOS // 60} h).",
+            "`/unmute` — Devolve a fala do membro.",
+            f"`/clear` — Apaga mensagens do canal "
+            f"(Moderador: até {MODERADOR_CLEAR_MAX}; "
+            f"ADM: até {LIMPAR_MAXIMO}).",
+        ]
+
+        if pode_moderar(membro):
+            linhas += [
+                "",
+                "**Somente ADM ou superior:**",
+                "`/ban` — Bane um membro.",
+                "`/unban` — Desbane pelo ID.",
+            ]
+
+        return "\n".join(linhas)
+
+    if chave == "servidor":
+        return (
+            "Para **ADM** ou superior.\n\n"
+            "`/organizar_cargos` — Reorganiza os cargos do servidor.\n"
+            "`/role add` — Dá um cargo a um membro.\n"
+            "`/role remove` — Tira um cargo de um membro."
+        )
+
+    if chave == "automod":
+        return (
+            "Para quem tem o cargo **automod**.\n\n"
+            "`/automod add` — Bloqueia uma palavra nova.\n"
+            "`/automod remover` — Tira uma palavra da lista.\n"
+            "`/automod listar` — Mostra as palavras bloqueadas.\n\n"
+            "Cargos dono, adm e automod não são censurados."
+        )
+
+    return ""
+
+
+def montar_embed_ajuda(chave: str, membro) -> discord.Embed:
+    """Monta a página da ajuda: título, categoria, comandos e mapa."""
+
+    abas = abas_visiveis(membro)
+    atual = next((aba for aba in abas if aba[0] == chave), abas[0])
 
     embed = discord.Embed(
-        title="📚 Lista de comandos",
-        description="Confira os comandos disponíveis do bot!",
+        title="📖 Central de Ajuda",
+        description=(
+            f"## {atual[1]} {atual[2]}\n{texto_da_aba(atual[0], membro)}"
+        ),
         color=discord.Color.blue()
     )
 
-    embed.add_field(
-        name="🌐 Comandos (funcionam com / e com ?)",
-        value=(
-            "`/ajuda` ou `?ajuda` — Mostra esta lista de comandos.\n"
-            "`/novidades` ou `?novidades` — Mostra as últimas mudanças.\n"
-            "`/ola` ou `?ola` — Envia mensagens de saudação.\n"
-            "`/oi_posso_falar` ou `?oi_posso_falar` — Oi, posso falar?\n"
-            "`/ping` ou `?ping` — Mostra a latência do bot.\n"
-            "`/avatar` ou `?avatar` — Mostra o avatar de um membro.\n"
-            "`/dado` ou `?dado` — Rola um dado.\n"
-            "`/enquete` ou `?enquete` — Cria uma enquete com até 5 opções.\n"
-            "`/organizar_cargos` ou `?organizar_cargos` — "
-            "Reorganiza os cargos do servidor (dono, admin ou ADM)."
-        ),
-        inline=False
+    mapa = "  ".join(
+        f"**{aba[1]} {aba[3]}**" if aba[0] == atual[0] else f"{aba[1]} {aba[3]}"
+        for aba in abas
     )
 
-    embed.add_field(
-        name="🔧 Administração (dono, admin ou ADM)",
-        value=(
-            "`/lock` — Fecha o canal para os membros.\n"
-            "`/unlock` — Abre o canal de novo.\n"
-            "`/kick` — Expulsa um membro.\n"
-            "`/ban` — Bane um membro.\n"
-            "`/unban` — Desbane pelo ID.\n"
-            "`/mute` — Deixa um membro sem falar por X minutos.\n"
-            "`/unmute` — Devolve a fala do membro.\n"
-            "`/clear` — Apaga mensagens do canal (1 a 1000).\n"
-            "`/automod add|remover|listar` — Palavras censuradas "
-            "(cargos dono, adm e automod não são censurados)."
-        ),
-        inline=False
+    embed.add_field(name="Categorias", value=mapa, inline=False)
+    embed.set_footer(text=f"Solicitado por {membro.name}")
+
+    return embed
+
+
+class AjudaView(discord.ui.View):
+    """Botões de navegação da ajuda (só quem pediu consegue usar)."""
+
+    def __init__(self, autor, aba_inicial: str = "inicio"):
+        super().__init__(timeout=180)
+        self.autor = autor
+        self.aba = aba_inicial
+        self.mensagem: discord.Message | None = None
+
+        for indice, aba in enumerate(abas_visiveis(autor)):
+            botao = discord.ui.Button(
+                label=aba[3],
+                emoji=aba[1],
+                custom_id=f"ajuda:{aba[0]}",
+                row=0 if indice < 5 else 1  # o Discord limita 5 por linha
+            )
+            botao.callback = self.criar_callback(aba[0])
+            self.add_item(botao)
+
+        self.atualizar_botoes()
+
+    def criar_callback(self, chave: str):
+        async def callback(interaction: discord.Interaction):
+            self.aba = chave
+            self.atualizar_botoes()
+
+            await interaction.response.edit_message(
+                embed=montar_embed_ajuda(chave, self.autor),
+                view=self
+            )
+
+        return callback
+
+    def atualizar_botoes(self) -> None:
+        """Destaca e trava o botão da aba em que o membro está."""
+
+        for botao in self.children:
+            atual = botao.custom_id == f"ajuda:{self.aba}"
+            botao.disabled = atual
+            botao.style = (
+                discord.ButtonStyle.primary
+                if atual
+                else discord.ButtonStyle.secondary
+            )
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ) -> bool:
+
+        if interaction.user.id != self.autor.id:
+            await interaction.response.send_message(
+                "Só quem usou o comando pode navegar! "
+                "Use `/ajuda` para abrir a sua.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    async def on_timeout(self) -> None:
+        # Tirar os botões é cortesia; falha do Discord aqui não importa.
+        if self.mensagem is None:
+            return
+
+        try:
+            await self.mensagem.edit(view=None)
+        except discord.HTTPException:
+            pass
+
+
+@bot.hybrid_command(
+    name="ajuda",
+    description="Mostra a central de ajuda com os comandos do bot"
+)
+async def ajuda(ctx: commands.Context):
+    view = AjudaView(ctx.author)
+
+    view.mensagem = await ctx.reply(
+        embed=montar_embed_ajuda("inicio", ctx.author),
+        view=view,
+        ephemeral=True
     )
-
-    embed.add_field(
-        name="⌨️ Somente com prefixo ?",
-        value=(
-            "`?teste` — Testa se o bot está funcionando.\n"
-            "`?enviar_embed` — Envia um embed com uma mensagem sua.\n"
-            "`?sync` — Re-sincroniza os comandos slash (só o dono do bot)."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="💡 Dica",
-        value=(
-            "Nos comandos com `?`, use aspas para textos com espaço:\n"
-            "`?enquete \"Qual jogo?\" \"Minecraft\" \"Valorant\"`"
-        ),
-        inline=False
-    )
-
-    embed.set_footer(text=f"Solicitado por {ctx.author.name}")
-
-    await ctx.reply(embed=embed, ephemeral=True)
 
 
 # ------------------------------------------- organização de cargos
@@ -889,8 +1060,9 @@ async def ajuda(ctx: commands.Context):
 # comparação dos nomes é feita sem acento e em minúsculas.
 ORDEM_CARGOS = [
     ["dono"],
-    ["adm", "admin", "administrador", "staff", "mod", "moderador"],
+    ["adm", "admin", "administrador", "staff"],
     ["bobbot", "bob bot"],
+    ["moderador", "mod"],  # abaixo do bot: ele precisa punir moderadores
     ["membro", "membros"],
     [
         "homem", "homens", "mulher", "mulheres",
@@ -948,6 +1120,43 @@ def pode_moderar(membro) -> bool:
     return tem_cargo_adm(membro)
 
 
+def tem_cargo_moderador(membro) -> bool:
+    """Diz se o membro é Moderador ou está acima dele na hierarquia."""
+
+    if membro is None:
+        return False
+
+    cargos = list(getattr(membro, "roles", ()))
+
+    if any(cargo.id in CARGOS_MODERADOR for cargo in cargos):
+        return True
+
+    guild = getattr(membro, "guild", None)
+
+    if guild is None:
+        return False
+
+    # Cargo acima do Moderador na hierarquia também conta.
+    posicoes = [
+        cargo.position
+        for cargo in (guild.get_role(i) for i in CARGOS_MODERADOR)
+        if cargo is not None
+    ]
+
+    if not posicoes:
+        return False
+
+    topo = getattr(membro, "top_role", None)
+
+    return topo is not None and topo.position >= min(posicoes)
+
+
+def pode_moderar_basico(membro) -> bool:
+    """Regra da moderação do dia a dia: Moderador, ADM, admin ou dono."""
+
+    return pode_moderar(membro) or tem_cargo_moderador(membro)
+
+
 def calcular_nova_ordem(cargos, id_cargo_do_bot, limite_bot, limite_autor):
     """Planeja a nova ordem dos cargos, sem tocar no Discord.
 
@@ -972,7 +1181,7 @@ def calcular_nova_ordem(cargos, id_cargo_do_bot, limite_bot, limite_autor):
                 return indice
 
         if nome.startswith("outro"):
-            return 4  # "Outro/Prefiro não falar" e variações do nome
+            return 5  # "Outro/Prefiro não falar" e variações do nome
 
         return len(ORDEM_CARGOS)  # cargo desconhecido: fica para o final
 
@@ -1142,6 +1351,27 @@ async def exigir_adm(ctx: commands.Context) -> bool:
     return True
 
 
+async def exigir_moderador(ctx: commands.Context) -> bool:
+    """Como exigir_adm, mas libera também o cargo Moderador."""
+
+    if ctx.guild is None:
+        await ctx.reply(
+            "Esse comando só funciona dentro de um servidor.",
+            ephemeral=True
+        )
+        return False
+
+    if not pode_moderar_basico(ctx.author):
+        await ctx.reply(
+            "Só **Moderador** ou superior (ADM, admin ou dono) "
+            "pode usar esse comando.",
+            ephemeral=True
+        )
+        return False
+
+    return True
+
+
 def motivo_de_nao_punir(guild, autor, alvo) -> str | None:
     """Diz por que o autor não pode punir esse membro (None = pode)."""
 
@@ -1172,7 +1402,7 @@ async def lock(
     ctx: commands.Context,
     canal: discord.TextChannel | None = None
 ):
-    if not await exigir_adm(ctx):
+    if not await exigir_moderador(ctx):
         return
 
     alvo = canal or ctx.channel
@@ -1235,7 +1465,7 @@ async def unlock(
     ctx: commands.Context,
     canal: discord.TextChannel | None = None
 ):
-    if not await exigir_adm(ctx):
+    if not await exigir_moderador(ctx):
         return
 
     alvo = canal or ctx.channel
@@ -1422,7 +1652,7 @@ async def kick(
     *,
     motivo: str = "sem motivo informado"
 ):
-    if not await exigir_adm(ctx):
+    if not await exigir_moderador(ctx):
         return
 
     problema = motivo_de_nao_punir(ctx.guild, ctx.author, membro)
@@ -1463,7 +1693,7 @@ async def kick(
 )
 @app_commands.describe(
     membro="Quem vai ficar sem falar",
-    minutos="Quanto tempo em minutos (padrão 10, máximo 40320)",
+    minutos="Quanto tempo em minutos (padrão 10; Moderador até 1440)",
     motivo="Motivo do silenciamento"
 )
 async def mute(
@@ -1473,7 +1703,7 @@ async def mute(
     *,
     motivo: str = "sem motivo informado"
 ):
-    if not await exigir_adm(ctx):
+    if not await exigir_moderador(ctx):
         return
 
     problema = motivo_de_nao_punir(ctx.guild, ctx.author, membro)
@@ -1482,7 +1712,20 @@ async def mute(
         await ctx.reply(f"Não posso silenciar: {problema}", ephemeral=True)
         return
 
-    minutos = max(1, min(minutos, 40320))
+    limite = 40320
+
+    if not pode_moderar(ctx.author):
+        limite = MODERADOR_MUTE_MAX_MINUTOS
+
+    if minutos > limite:
+        await ctx.reply(
+            f"Seu limite de silenciamento é de **{limite}** minuto(s) "
+            f"({limite // 60} h). Peça a um ADM para tempos maiores.",
+            ephemeral=True
+        )
+        return
+
+    minutos = max(1, minutos)
 
     try:
         await membro.timeout(
@@ -1523,7 +1766,7 @@ async def mute(
 )
 @app_commands.describe(membro="Quem vai poder falar de novo")
 async def unmute(ctx: commands.Context, membro: discord.Member):
-    if not await exigir_adm(ctx):
+    if not await exigir_moderador(ctx):
         return
 
     try:
@@ -1742,7 +1985,16 @@ async def pode_limpar(ctx: commands.Context) -> bool:
     if await bot.is_owner(ctx.author):
         return True
 
-    return pode_moderar(ctx.author)
+    return pode_moderar_basico(ctx.author)
+
+
+def limite_do_clear(membro) -> int:
+    """Moderador apaga até 100 de uma vez; ADM e acima até 1000."""
+
+    if pode_moderar(membro):
+        return LIMPAR_MAXIMO
+
+    return MODERADOR_CLEAR_MAX
 
 
 async def responder_rapido(ctx: commands.Context, texto: str) -> None:
@@ -1759,7 +2011,7 @@ async def responder_rapido(ctx: commands.Context, texto: str) -> None:
 
 @bot.hybrid_command(
     name="clear",
-    description="Apaga mensagens do canal (dono, admin ou ADM)"
+    description="Apaga mensagens do canal (Moderador ou superior)"
 )
 @app_commands.describe(
     quantidade=f"Quantas mensagens apagar (1 a {LIMPAR_MAXIMO})"
@@ -1786,10 +2038,12 @@ async def clear(ctx: commands.Context, quantidade: int):
         )
         return
 
-    if quantidade > LIMPAR_MAXIMO:
+    maximo = limite_do_clear(ctx.author)
+
+    if quantidade > maximo:
         await responder_rapido(
             ctx,
-            f"O máximo que apago de uma vez é **{LIMPAR_MAXIMO}** "
+            f"O máximo que você pode apagar de uma vez é **{maximo}** "
             "mensagens. Tente um número menor."
         )
         return
@@ -1960,6 +2214,38 @@ def tem_cargo_automod(membro) -> bool:
     )
 
 
+def pode_usar_automod(membro) -> bool:
+    """Quem pode usar o /automod: cargo automod (e, se liberado, ADM/dono)."""
+
+    if membro is None:
+        return False
+
+    if tem_cargo_automod(membro):
+        return True
+
+    return not AUTOMOD_APENAS_CARGO and pode_moderar(membro)
+
+
+async def exigir_automod(ctx: commands.Context) -> bool:
+    """Confere servidor e permissão do /automod; avisa e devolve False."""
+
+    if ctx.guild is None:
+        await ctx.reply(
+            "Esse comando só funciona dentro de um servidor.",
+            ephemeral=True
+        )
+        return False
+
+    if not pode_usar_automod(ctx.author):
+        await ctx.reply(
+            "Só quem tem o cargo **automod** pode usar esse comando.",
+            ephemeral=True
+        )
+        return False
+
+    return True
+
+
 async def aplicar_automod(mensagem: discord.Message) -> bool:
     """Apaga a mensagem com palavra bloqueada e avisa o autor.
 
@@ -2112,7 +2398,7 @@ async def automod(ctx: commands.Context):
 
 
 async def listar_palavras_automod(ctx: commands.Context) -> None:
-    if not await exigir_adm(ctx):
+    if not await exigir_automod(ctx):
         return
 
     if not _palavras_automod:
@@ -2139,7 +2425,7 @@ async def listar_palavras_automod(ctx: commands.Context) -> None:
 @automod.command(name="add", description="Bloqueia uma palavra nova")
 @app_commands.describe(palavra="Palavra ou frase que será censurada")
 async def automod_add(ctx: commands.Context, *, palavra: str):
-    if not await exigir_adm(ctx):
+    if not await exigir_automod(ctx):
         return
 
     palavra = palavra.strip()
@@ -2185,7 +2471,7 @@ async def automod_add(ctx: commands.Context, *, palavra: str):
 @automod.command(name="remover", description="Tira uma palavra da lista")
 @app_commands.describe(palavra="Palavra que vai sair da censura")
 async def automod_remover(ctx: commands.Context, *, palavra: str):
-    if not await exigir_adm(ctx):
+    if not await exigir_automod(ctx):
         return
 
     chave = normalizar_nome(palavra)
